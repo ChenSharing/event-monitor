@@ -1,0 +1,35 @@
+name: 每日赛事监控 (公开仓库)
+
+on:
+  schedule:
+    - cron: '30 1 * * *'   # 每日 UTC 01:30 → 北京时间 09:30
+  workflow_dispatch:        # 支持手动触发
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行监控脚本
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}  # 从 Secrets 注入
+        run: python monitor.py
+
+      # （可选）如果不想公开 events.json，可以不上传 artifact
+      # 公开仓库的 artifact 也是公开的，所以如果你担心数据隐私，就别上传
+      # - name: 上传缓存（可选）
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: events-data
+      #     path: events.json
