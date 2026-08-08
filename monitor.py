@@ -52,7 +52,7 @@ def extract_dates(text):
 
 def extract_info_with_ai(page_text, url):
     """
-    调用智谱 GLM-4.7 模型解析页面关键信息
+    调用智谱 GLM-4-Flash 免费模型解析页面关键信息
     返回字典，包含 title, reg_deadline, event_date, location, notes, summary
     """
     if not ZHIPU_API_KEY:
@@ -85,25 +85,33 @@ def extract_info_with_ai(page_text, url):
     api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     payload = {
         # ============================================================
-        # 用户指定使用 GLM-4.7 模型
-        # 注意：智谱公开 API 标准模型一般为 glm-4、glm-4-flash、glm-4-plus
-        # 如果 glm-4.7 不可用（返回 1210 错误），请将下面改为上述标准模型
+        # 使用智谱免费模型 GLM-4-Flash（免费额度充足）
         # ============================================================
-        "model": "glm-4.7",
+        "model": "glm-4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
         "response_format": {"type": "json_object"}
     }
     
     try:
-        print(f"      📤 正在调用智谱 API（模型: glm-4.7）...")
+        print(f"      📤 正在调用智谱 API（免费模型: glm-4-flash）...")
         resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
         
         print(f"      📥 HTTP 状态码: {resp.status_code}")
         
         if resp.status_code != 200:
-            error_body = resp.text[:500]
+            # 打印完整错误响应，方便排查
+            error_body = resp.text[:800]
             print(f"      ❌ API 返回错误: {error_body}")
+            # 尝试解析错误信息
+            try:
+                err_json = resp.json()
+                if 'error' in err_json:
+                    error_code = err_json['error'].get('code', '')
+                    error_msg = err_json['error'].get('message', '')
+                    print(f"      ❌ 错误码: {error_code}, 错误信息: {error_msg}")
+            except:
+                pass
             return None
             
         result = resp.json()
@@ -126,6 +134,7 @@ def extract_info_with_ai(page_text, url):
         return None
     except json.JSONDecodeError as e:
         print(f"      ❌ AI 返回的 JSON 解析失败: {e}")
+        print(f"      返回内容: {resp.text[:200] if 'resp' in locals() else '无响应'}")
         return None
     except Exception as e:
         print(f"      ❌ AI 解析未知错误: {e}")
