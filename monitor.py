@@ -11,17 +11,21 @@ from datetime import datetime
 # ======================== 读取环境变量 ========================
 FEISHU_WEBHOOK = os.environ.get('FEISHU_WEBHOOK', '')
 ZHIPU_API_KEY = os.environ.get('ZHIPU_API_KEY', '')
+
+print(f"🔑 FEISHU_WEBHOOK 是否配置: {'✅ 是' if FEISHU_WEBHOOK else '❌ 否'}")
+print(f"🔑 ZHIPU_API_KEY 是否配置: {'✅ 是' if ZHIPU_API_KEY else '❌ 否'}")
+if ZHIPU_API_KEY:
+    print(f"   API Key 前缀: {ZHIPU_API_KEY[:8]}...")
+
 if not FEISHU_WEBHOOK:
     print("⚠️ 警告：未设置 FEISHU_WEBHOOK 环境变量，将跳过飞书推送。")
 if not ZHIPU_API_KEY:
     print("⚠️ 警告：未设置 ZHIPU_API_KEY 环境变量，将跳过 AI 解析。")
 
 # ======================== 读取配置 ========================
-# urls.txt 每行一个网址
 with open('urls.txt', 'r') as f:
     URLS = [line.strip() for line in f if line.strip()]
 
-# events.json 用于去重缓存
 try:
     with open('events.json', 'r') as f:
         known_events = json.load(f)
@@ -30,20 +34,16 @@ except (FileNotFoundError, json.JSONDecodeError):
 
 # ======================== 辅助函数 ========================
 def extract_dates(text):
-    """
-    使用正则从文本中提取各种日期格式，用于后备匹配
-    """
     patterns = [
-        r'(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})',   # 2026-08-15 或 2026/08/15
-        r'(\d{1,2}月\d{1,2}日)',              # 8月15日
-        r'(\d{4}年\d{1,2}月\d{1,2}日)',       # 2026年8月15日
-        r'(\d{1,2}/\d{1,2})'                  # 8/15（简单月份日期）
+        r'(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})',
+        r'(\d{1,2}月\d{1,2}日)',
+        r'(\d{4}年\d{1,2}月\d{1,2}日)',
+        r'(\d{1,2}/\d{1,2})'
     ]
     found = []
     for pat in patterns:
         matches = re.findall(pat, text)
         found.extend(matches)
-    # 去重并保留原始顺序
     unique = []
     for item in found:
         if item not in unique:
@@ -52,13 +52,12 @@ def extract_dates(text):
 
 def extract_info_with_ai(page_text, url):
     """
-    调用智谱 GLM-4 或 GLM-4-Flash 解析页面关键信息
+    调用智谱 GLM-4.7 模型解析页面关键信息
     返回字典，包含 title, reg_deadline, event_date, location, notes, summary
     """
     if not ZHIPU_API_KEY:
         return None
 
-    # 截断文本防止 token 超限（约 4000 字符对应 1000~1500 tokens）
     if len(page_text) > 4000:
         page_text = page_text[:4000] + "..."
 
@@ -83,35 +82,56 @@ def extract_info_with_ai(page_text, url):
         "Authorization": f"Bearer {ZHIPU_API_KEY}",
         "Content-Type": "application/json"
     }
-    # 智谱 API 地址（兼容 OpenAI 格式）
     api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     payload = {
-        "model": "glm-4",          # 或者用 "glm-4-flash" 更便宜
+        # ============================================================
+        # 用户指定使用 GLM-4.7 模型
+        # 注意：智谱公开 API 标准模型一般为 glm-4、glm-4-flash、glm-4-plus
+        # 如果 glm-4.7 不可用（返回 1210 错误），请将下面改为上述标准模型
+        # ============================================================
+        "model": "glm-4.7",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "response_format": {"type": "json_object"}   # 智谱支持
+        "response_format": {"type": "json_object"}
     }
+    
     try:
+        print(f"      📤 正在调用智谱 API（模型: glm-4.7）...")
         resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
+        
+        print(f"      📥 HTTP 状态码: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            error_body = resp.text[:500]
+            print(f"      ❌ API 返回错误: {error_body}")
+            return None
+            
         result = resp.json()
         content = result['choices'][0]['message']['content']
         data = json.loads(content)
-        # 确保包含所有必要字段
+        
         required = ["title", "reg_deadline", "event_date", "location", "notes", "summary"]
         for field in required:
             if field not in data:
                 data[field] = ""
+        
+        print(f"      ✅ AI 解析成功: {data.get('title', '')[:30]}")
         return data
+        
+    except requests.exceptions.Timeout:
+        print(f"      ❌ AI 解析超时（30秒）")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"      ❌ AI 解析网络错误: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"      ❌ AI 返回的 JSON 解析失败: {e}")
+        return None
     except Exception as e:
-        print(f"  ❌ AI 解析失败: {e}")
+        print(f"      ❌ AI 解析未知错误: {e}")
         return None
 
 def send_feishu_aggregated(events_list):
-    """
-    将新发现的所有事件汇总成一条飞书消息，避免刷屏
-    events_list: 列表，每个元素是包含提取字段的字典
-    """
     if not events_list:
         return
     if not FEISHU_WEBHOOK:
@@ -125,29 +145,23 @@ def send_feishu_aggregated(events_list):
         lines.append("")
         title = ev.get('title', '未命名赛事')
         lines.append(f"【{title}】")
-        # 核心摘要
         summary = ev.get('summary', '')
         if summary:
             lines.append(summary)
-        # 报名截止
         reg = ev.get('reg_deadline', '')
         if reg:
             lines.append(f"报名截止：{reg}")
-        # 比赛时间
         event_date = ev.get('event_date', '')
         if event_date:
             lines.append(f"比赛时间：{event_date}")
-        # 地点
         loc = ev.get('location', '')
         if loc:
             lines.append(f"地点：{loc}")
-        # 备注
         notes = ev.get('notes', '')
         if notes:
             lines.append(f"特别提醒：{notes}")
-        # 官网链接
         lines.append(f"官网：{ev['url']}")
-        lines.append("")   # 空行分隔
+        lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("💡 请及时设置日历提醒（提前1周 + 提前1天）")
@@ -163,30 +177,28 @@ def send_feishu_aggregated(events_list):
 # ======================== 主逻辑 ========================
 def main():
     new_events = []
-    print(f"🔍 开始监控 {len(URLS)} 个网址...")
+    print(f"\n🔍 开始监控 {len(URLS)} 个网址...")
+    print("=" * 50)
 
-    for url in URLS:
-        print(f"\n  → 检查 {url}")
+    for idx, url in enumerate(URLS, 1):
+        print(f"\n[{idx}/{len(URLS)}] 检查 {url}")
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, 'html.parser')
 
-            # 移除脚本和样式标签，提取可见文本
             for script in soup(["script", "style"]):
                 script.decompose()
             text = soup.get_text(separator="\n", strip=True)
-            # 清理多余空行
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             page_text = "\n".join(lines)
 
-            # 1. 提取日期作为后备（仅用于去重辅助）
             raw_dates = extract_dates(page_text)
+            print(f"      📅 正则提取到日期: {raw_dates if raw_dates else '无'}")
 
-            # 2. 调用 AI 解析
             ai_data = extract_info_with_ai(page_text, url)
+            
             if not ai_data:
-                # AI 失败时，用页面标题 + 第一个日期兜底
                 title = soup.title.string.strip() if soup.title and soup.title.string else url.split('/')[2]
                 ai_data = {
                     "title": title,
@@ -196,12 +208,11 @@ def main():
                     "location": "",
                     "notes": ""
                 }
+                print(f"      ⚠️ 使用兜底数据")
             else:
-                # 如果 AI 没有提取到日期，但正则匹配到了，补充进去
                 if not ai_data.get('event_date') and raw_dates:
                     ai_data['event_date'] = raw_dates[0]
 
-            # 3. 生成唯一标识（url + 标题 + 比赛日期），防止重复
             event_key = f"{url}_{ai_data.get('title', '')}_{ai_data.get('event_date', '')}"
             if event_key not in known_events:
                 event_data = {
@@ -216,18 +227,20 @@ def main():
                 }
                 known_events[event_key] = event_data
                 new_events.append(event_data)
-                print(f"    ✅ 发现新事件：{ai_data.get('title')} -> {ai_data.get('event_date')}")
+                print(f"      ✅ 新事件已记录")
             else:
-                print(f"    ⏳ 已存在：{ai_data.get('title')}")
+                print(f"      ⏳ 已存在，跳过")
 
+        except requests.exceptions.Timeout:
+            print(f"      ❌ 请求超时（15秒）")
+        except requests.exceptions.RequestException as e:
+            print(f"      ❌ 请求失败: {e}")
         except Exception as e:
-            print(f"    ❌ 检查失败: {e}")
+            print(f"      ❌ 未知错误: {e}")
 
-    # 保存缓存到 events.json（用于下次去重）
     with open('events.json', 'w') as f:
         json.dump(known_events, f, ensure_ascii=False, indent=2)
 
-    # 汇总推送
     if new_events:
         send_feishu_aggregated(new_events)
     else:
