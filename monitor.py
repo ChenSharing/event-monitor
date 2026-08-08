@@ -23,11 +23,11 @@ if not ZHIPU_API_KEY:
     print("⚠️ 警告：未设置 ZHIPU_API_KEY 环境变量，将跳过 AI 解析。")
 
 # ======================== 读取配置 ========================
-with open('urls.txt', 'r') as f:
+with open('urls.txt', 'r', encoding='utf-8') as f:
     URLS = [line.strip() for line in f if line.strip()]
 
 try:
-    with open('events.json', 'r') as f:
+    with open('events.json', 'r', encoding='utf-8') as f:
         known_events = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError):
     known_events = {}
@@ -51,13 +51,10 @@ def extract_dates(text):
     return unique
 
 def extract_info_with_ai(page_text, url):
-    """
-    调用智谱 GLM-4-Flash 免费模型解析页面关键信息
-    返回字典，包含 title, reg_deadline, event_date, location, notes, summary
-    """
     if not ZHIPU_API_KEY:
         return None
 
+    # 截断文本，防止 token 超限（glm-4-flash 支持 8K 上下文，但我们保守截断）
     if len(page_text) > 4000:
         page_text = page_text[:4000] + "..."
 
@@ -84,60 +81,36 @@ def extract_info_with_ai(page_text, url):
     }
     api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     payload = {
-        # ============================================================
-        # 使用智谱免费模型 GLM-4-Flash（免费额度充足）
-        # ============================================================
-        "model": "glm-4-flash",
+        "model": "glm-4-flash",          # 免费模型
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
         "response_format": {"type": "json_object"}
     }
-    
+
     try:
-        print(f"      📤 正在调用智谱 API（免费模型: glm-4-flash）...")
+        print(f"      📤 调用智谱 API（glm-4-flash）...")
         resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
-        
         print(f"      📥 HTTP 状态码: {resp.status_code}")
-        
+
         if resp.status_code != 200:
-            # 打印完整错误响应，方便排查
             error_body = resp.text[:800]
-            print(f"      ❌ API 返回错误: {error_body}")
-            # 尝试解析错误信息
-            try:
-                err_json = resp.json()
-                if 'error' in err_json:
-                    error_code = err_json['error'].get('code', '')
-                    error_msg = err_json['error'].get('message', '')
-                    print(f"      ❌ 错误码: {error_code}, 错误信息: {error_msg}")
-            except:
-                pass
+            print(f"      ❌ API 错误: {error_body}")
             return None
-            
+
         result = resp.json()
         content = result['choices'][0]['message']['content']
         data = json.loads(content)
-        
+
         required = ["title", "reg_deadline", "event_date", "location", "notes", "summary"]
         for field in required:
             if field not in data:
                 data[field] = ""
-        
+
         print(f"      ✅ AI 解析成功: {data.get('title', '')[:30]}")
         return data
-        
-    except requests.exceptions.Timeout:
-        print(f"      ❌ AI 解析超时（30秒）")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"      ❌ AI 解析网络错误: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"      ❌ AI 返回的 JSON 解析失败: {e}")
-        print(f"      返回内容: {resp.text[:200] if 'resp' in locals() else '无响应'}")
-        return None
+
     except Exception as e:
-        print(f"      ❌ AI 解析未知错误: {e}")
+        print(f"      ❌ AI 解析失败: {e}")
         return None
 
 def send_feishu_aggregated(events_list):
@@ -150,25 +123,19 @@ def send_feishu_aggregated(events_list):
     today_str = datetime.now().strftime("%Y年%m月%d日")
     lines = [f"📢 赛事最新动态（{today_str}）", "━━━━━━━━━━━━━━━━━━━━"]
 
-    for idx, ev in enumerate(events_list, 1):
+    for ev in events_list:
         lines.append("")
-        title = ev.get('title', '未命名赛事')
-        lines.append(f"【{title}】")
-        summary = ev.get('summary', '')
-        if summary:
-            lines.append(summary)
-        reg = ev.get('reg_deadline', '')
-        if reg:
-            lines.append(f"报名截止：{reg}")
-        event_date = ev.get('event_date', '')
-        if event_date:
-            lines.append(f"比赛时间：{event_date}")
-        loc = ev.get('location', '')
-        if loc:
-            lines.append(f"地点：{loc}")
-        notes = ev.get('notes', '')
-        if notes:
-            lines.append(f"特别提醒：{notes}")
+        lines.append(f"【{ev.get('title', '未命名赛事')}】")
+        if ev.get('summary'):
+            lines.append(ev['summary'])
+        if ev.get('reg_deadline'):
+            lines.append(f"报名截止：{ev['reg_deadline']}")
+        if ev.get('event_date'):
+            lines.append(f"比赛时间：{ev['event_date']}")
+        if ev.get('location'):
+            lines.append(f"地点：{ev['location']}")
+        if ev.get('notes'):
+            lines.append(f"特别提醒：{ev['notes']}")
         lines.append(f"官网：{ev['url']}")
         lines.append("")
 
@@ -194,19 +161,22 @@ def main():
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
+            # 尝试用 UTF-8 解码，如果失败则忽略错误字符
+            resp.encoding = 'utf-8'
             soup = BeautifulSoup(resp.text, 'html.parser')
 
             for script in soup(["script", "style"]):
                 script.decompose()
             text = soup.get_text(separator="\n", strip=True)
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            page_text = "\n".join(lines)
+            # 过滤掉无法解码的字符（保留可见文本）
+            text = ''.join(c for c in text if c.isprintable() or c == '\n')
+            page_text = text
 
             raw_dates = extract_dates(page_text)
-            print(f"      📅 正则提取到日期: {raw_dates if raw_dates else '无'}")
+            print(f"      📅 正则日期: {raw_dates if raw_dates else '无'}")
 
             ai_data = extract_info_with_ai(page_text, url)
-            
+
             if not ai_data:
                 title = soup.title.string.strip() if soup.title and soup.title.string else url.split('/')[2]
                 ai_data = {
@@ -240,14 +210,10 @@ def main():
             else:
                 print(f"      ⏳ 已存在，跳过")
 
-        except requests.exceptions.Timeout:
-            print(f"      ❌ 请求超时（15秒）")
-        except requests.exceptions.RequestException as e:
-            print(f"      ❌ 请求失败: {e}")
         except Exception as e:
-            print(f"      ❌ 未知错误: {e}")
+            print(f"      ❌ 处理失败: {e}")
 
-    with open('events.json', 'w') as f:
+    with open('events.json', 'w', encoding='utf-8') as f:
         json.dump(known_events, f, ensure_ascii=False, indent=2)
 
     if new_events:
