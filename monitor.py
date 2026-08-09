@@ -4,7 +4,6 @@
 import requests
 from bs4 import BeautifulSoup
 import json
-import re
 import os
 from datetime import datetime, timedelta
 
@@ -12,8 +11,8 @@ from datetime import datetime, timedelta
 FEISHU_WEBHOOK = os.environ.get('FEISHU_WEBHOOK', '')
 ZHIPU_API_KEY = os.environ.get('ZHIPU_API_KEY', '')
 
-print(f"🔑 FEISHU_WEBHOOK: {'✅' if FEISHU_WEBHOOK else '❌'}")
-print(f"🔑 ZHIPU_API_KEY: {'✅' if ZHIPU_API_KEY else '❌'}")
+print(f"🔑 FEISHU: {'✅' if FEISHU_WEBHOOK else '❌'}")
+print(f"🔑 ZHIPU: {'✅' if ZHIPU_API_KEY else '❌'}")
 
 # ======================== 配置 ========================
 with open('urls.txt', 'r', encoding='utf-8') as f:
@@ -22,61 +21,53 @@ with open('urls.txt', 'r', encoding='utf-8') as f:
 try:
     with open('events.json', 'r', encoding='utf-8') as f:
         known_events = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
+except:
     known_events = {}
 
-# ======================== AI 提取函数 ========================
+# ======================== AI 提取 ========================
 def extract_info_with_ai(page_text, url):
     if not ZHIPU_API_KEY:
         return None
 
-    # 截断文本，控制 token
     if len(page_text) > 3000:
         page_text = page_text[:3000] + "..."
 
     prompt = f"""
-你是一个专业的赛事活动信息提取助手。从网页内容中提取关键信息，输出 JSON 格式（只输出 JSON，不要附加任何文字）。
+你是赛事活动信息提取助手。从以下网页内容中提取重要的赛事/活动信息，遵循以下原则：
 
-【提取规则】
-1. 时间类：报名截止、考试时间、比赛日期、报名开始、成绩公布、参赛确认
-2. 节点类：初赛、复赛、决赛、总决赛、终评、第一轮、第二轮（判断是哪个节点）
-3. 地点类：城市、具体场馆
-4. 区分"开始"和"截止"
-5. 如果有具体时间（如16:00截止），保留
-6. 如果有"预计""待定"等不确定词，标记 is_confirmed=false
-7. 核心判断：事件是否已发生？未发生才提取，已发生的直接忽略
+1. **筛选标准**：
+   - 优先关注最近两个月内发布的通知；
+   - 但如果通知中提到的活动日期在未来（包括明年），即使通知发布时间早，也要提取；
+   - 如果活动日期明显已过去，忽略。
 
-【输出字段】
-{{
-  "title": "赛事/活动名称",
-  "is_confirmed": true/false,
-  "reg_deadline": "报名截止时间（含具体时刻）",
-  "event_date": "比赛日期",
-  "location": "举办地点",
-  "node_type": "初赛/复赛/决赛/终评/总决赛",
-  "deadline_urgent": true/false,
-  "status": "进行中/已截止/待确认/已过期",
-  "summary": "一句话核心内容",
-  "full_details": "详细说明"
-}}
+2. **提取内容**：
+   - 活动名称、关键时间节点（报名开始/截止、比赛日期等）
+   - 地点、日程安排、特别提醒（如“逾期视为放弃”）
+   - 保留原文关键表述。
+
+3. **输出格式（JSON）**：
+   {{
+     "title": "活动名称",
+     "summary": "一段完整的自然语言描述",
+     "reg_deadline": "YYYY-MM-DD",   // 报名截止日，没有则为空
+     "event_date": "YYYY-MM-DD",     // 比赛开始日，没有则为空
+     "is_confirmed": true/false,
+     "raw_dates": ["提取到的日期文本"]
+   }}
 
 网页内容：
 {page_text}
 """
-    headers = {
-        "Authorization": f"Bearer {ZHIPU_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {ZHIPU_API_KEY}", "Content-Type": "application/json"}
     api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     payload = {
         "model": "glm-4-flash",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
+        "temperature": 0.3,
         "response_format": {"type": "json_object"}
     }
 
     try:
-        print(f"      📤 调用智谱 AI...")
         resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
         if resp.status_code != 200:
             print(f"      ❌ API 错误: {resp.text[:200]}")
@@ -84,74 +75,73 @@ def extract_info_with_ai(page_text, url):
         result = resp.json()
         content = result['choices'][0]['message']['content']
         data = json.loads(content)
-        print(f"      ✅ AI 提取成功: {data.get('title', '')[:30]}")
+        print(f"      ✅ AI 提取: {data.get('title', '')[:30]}")
         return data
     except Exception as e:
-        print(f"      ❌ AI 提取失败: {e}")
+        print(f"      ❌ AI 失败: {e}")
         return None
 
-# ======================== 推送函数 ========================
-def send_feishu(events_list):
-    if not events_list or not FEISHU_WEBHOOK:
+# ======================== 飞书推送 ========================
+def send_feishu(msg):
+    if not FEISHU_WEBHOOK:
         return
-
-    today = datetime.now().strftime("%Y年%m月%d日")
-    lines = [f"📢 近期赛事信息汇总更新（{today}）", "━━━━━━━━━━━━━━━━━━━━"]
-
-    for ev in events_list:
-        lines.append("")
-        lines.append(f"【{ev.get('title', '未命名')}】")
-
-        if ev.get('summary'):
-            lines.append(ev['summary'])
-
-        if ev.get('is_confirmed') is False:
-            lines.append("⏳ 日期待确认（标注为'预计'）")
-
-        # 紧急提醒（7天内截止）
-        if ev.get('deadline_urgent'):
-            lines.append("⚠️ 即将截止，请尽快处理！")
-
-        if ev.get('reg_deadline'):
-            lines.append(f"📅 报名截止：{ev['reg_deadline']}")
-
-        if ev.get('event_date'):
-            lines.append(f"📅 比赛时间：{ev['event_date']}")
-
-        if ev.get('location'):
-            lines.append(f"📍 地点：{ev['location']}")
-
-        if ev.get('node_type'):
-            lines.append(f"🏷 节点：{ev['node_type']}")
-
-        if ev.get('status'):
-            lines.append(f"📌 状态：{ev['status']}")
-
-        if ev.get('full_details'):
-            lines.append(ev['full_details'])
-
-        lines.append(f"🔗 官网：{ev['url']}")
-        lines.append("")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 日历提醒：提前1周 + 提前1天")
-    msg = "\n".join(lines)
-
-    payload = {"msg_type": "text", "content": {"text": msg}}
     try:
-        requests.post(FEISHU_WEBHOOK, json=payload, timeout=5)
-        print(f"✅ 推送成功，共 {len(events_list)} 条")
+        requests.post(FEISHU_WEBHOOK, json={"msg_type": "text", "content": {"text": msg}}, timeout=5)
+        print(f"✅ 推送成功")
     except Exception as e:
         print(f"❌ 推送失败: {e}")
 
-# ======================== 去重函数 ========================
-def is_event_active(event_date_str):
-    """判断事件是否已过期，以事件日期为准"""
-    if not event_date_str:
-        return True  # 无日期默认保留
-    # 简单判断：如果包含"已截止""已过期"等关键词，则跳过
-    # 更复杂的日期解析留给 AI 判断
-    return True
+# ======================== 提醒检查 ========================
+def check_reminders():
+    today = datetime.now().date()
+    reminders_sent = []
+
+    for key, ev in known_events.items():
+        reminders = ev.get('reminders', [])
+
+        # 检查报名截止提醒
+        reg_date_str = ev.get('reg_deadline')
+        if reg_date_str:
+            try:
+                reg_date = datetime.strptime(reg_date_str, '%Y-%m-%d').date()
+                days = (reg_date - today).days
+                if days == 7 and '7d_reg' not in reminders:
+                    msg = f"⚠️ 提醒：{ev['title']} 报名截止倒计时7天！\n请尽快完成报名。\n🔗 {ev['url']}"
+                    send_feishu(msg)
+                    reminders.append('7d_reg')
+                elif days == 1 and '1d_reg' not in reminders:
+                    msg = f"🚨 紧急提醒：{ev['title']} 报名明天截止！\n逾期将无法参加，请立即登录官网办理。\n🔗 {ev['url']}"
+                    send_feishu(msg)
+                    reminders.append('1d_reg')
+            except:
+                pass
+
+        # 检查比赛日期提醒
+        event_date_str = ev.get('event_date')
+        if event_date_str:
+            try:
+                event_date = datetime.strptime(event_date_str, '%Y-%m-%d').date()
+                days = (event_date - today).days
+                if days == 7 and '7d_event' not in reminders:
+                    msg = f"📅 提醒：{ev['title']} 将于7天后开始！\n请做好准备。\n🔗 {ev['url']}"
+                    send_feishu(msg)
+                    reminders.append('7d_event')
+                elif days == 1 and '1d_event' not in reminders:
+                    msg = f"📅 提醒：{ev['title']} 明天正式开始！\n详细信息请查看官网。\n🔗 {ev['url']}"
+                    send_feishu(msg)
+                    reminders.append('1d_event')
+            except:
+                pass
+
+        # 更新提醒记录
+        if reminders != ev.get('reminders', []):
+            ev['reminders'] = reminders
+            reminders_sent.append(key)
+
+    # 如果有更新，保存到文件
+    if reminders_sent:
+        with open('events.json', 'w', encoding='utf-8') as f:
+            json.dump(known_events, f, ensure_ascii=False, indent=2)
 
 # ======================== 主程序 ========================
 def main():
@@ -159,6 +149,7 @@ def main():
     print(f"\n🔍 监控 {len(URLS)} 个网址...")
     print("=" * 50)
 
+    # 1. 抓取并发现新事件
     for idx, url in enumerate(URLS, 1):
         print(f"\n[{idx}/{len(URLS)}] {url}")
         try:
@@ -167,61 +158,65 @@ def main():
             resp.encoding = 'utf-8'
             soup = BeautifulSoup(resp.text, 'html.parser')
 
-            # 清除脚本和样式
             for tag in soup(["script", "style"]):
                 tag.decompose()
             text = soup.get_text(separator="\n", strip=True)
             text = ''.join(c for c in text if c.isprintable() or c == '\n')
-            page_text = text[:3000]  # 控制长度
+            page_text = text[:3000]
 
-            # AI 提取
             ai_data = extract_info_with_ai(page_text, url)
-
             if not ai_data:
-                # 兜底
                 title = soup.title.string.strip() if soup.title else url.split('/')[2]
                 ai_data = {
                     "title": title,
-                    "is_confirmed": False,
+                    "summary": "（AI 提取失败，请手动查看）",
                     "reg_deadline": "",
                     "event_date": "",
-                    "location": "",
-                    "node_type": "",
-                    "deadline_urgent": False,
-                    "status": "待核实",
-                    "summary": "AI 提取失败，请手动查看",
-                    "full_details": ""
+                    "is_confirmed": False,
+                    "raw_dates": []
                 }
-                print(f"      ⚠️ 使用兜底数据")
+                print(f"      ⚠️ 兜底")
 
-            # 判断是否已过期
-            if not is_event_active(ai_data.get('event_date', '')):
-                print(f"      ⏳ 事件已过期，跳过")
-                continue
-
-            # 去重
-            key = f"{url}_{ai_data.get('title', '')}_{ai_data.get('event_date', '')}"
+            key = f"{url}_{ai_data.get('title', '')}"
             if key not in known_events:
                 ai_data['url'] = url
                 ai_data['found_at'] = datetime.now().isoformat()
+                ai_data['reminders'] = []  # 新增提醒状态
                 known_events[key] = ai_data
                 new_events.append(ai_data)
-                print(f"      ✅ 新事件: {ai_data.get('title')}")
+                print(f"      ✅ 新事件")
             else:
+                # 若已有事件，检查日期是否有变化（可选），暂不处理
                 print(f"      ⏳ 已存在")
 
         except Exception as e:
             print(f"      ❌ 错误: {e}")
 
-    # 保存缓存
-    with open('events.json', 'w', encoding='utf-8') as f:
-        json.dump(known_events, f, ensure_ascii=False, indent=2)
-
-    # 推送
+    # 2. 保存新事件
     if new_events:
-        send_feishu(new_events)
+        with open('events.json', 'w', encoding='utf-8') as f:
+            json.dump(known_events, f, ensure_ascii=False, indent=2)
+
+        # 推送新事件汇总
+        today = datetime.now().strftime("%Y年%m月%d日")
+        lines = [f"📢 近期赛事信息汇总更新（{today}）", "━━━━━━━━━━━━━━━━━━━━"]
+        for ev in new_events:
+            lines.append("")
+            lines.append(f"【{ev.get('title', '未命名')}】")
+            if ev.get('summary'):
+                lines.append(ev['summary'])
+            if ev.get('is_confirmed') is False:
+                lines.append("⏳ 日期待确认")
+            lines.append(f"🔗 {ev['url']}")
+            lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 日历提醒：提前1周 + 提前1天")
+        send_feishu("\n".join(lines))
     else:
         print("\n📭 无新事件")
+
+    # 3. 无论有无新事件，都检查并发送提醒
+    check_reminders()
 
 if __name__ == "__main__":
     main()
